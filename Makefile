@@ -1,4 +1,4 @@
-obj-m += nct6687.o
+obj-m += nct6686.o
 
 curpwd      := $(shell pwd)
 kver        := $(shell uname -r)
@@ -9,13 +9,13 @@ commithash  := $(shell git rev-parse --short HEAD)
 build:
 	rm -rf ${curpwd}/${kver}
 	mkdir -p ${curpwd}/${kver}
-	cp ${curpwd}/Makefile ${curpwd}/nct6687.c ${curpwd}/${kver}
+	cp ${curpwd}/Makefile ${curpwd}/nct6686.c ${curpwd}/${kver}
 	cd ${curpwd}/${kver}
 	make -C /lib/modules/${kver}/build M=${curpwd}/${kver} modules
 install: build
-	sudo cp ${curpwd}/${kver}/nct6687.ko /lib/modules/${kver}/kernel/drivers/hwmon/
+	sudo cp ${curpwd}/${kver}/nct6686.ko /lib/modules/${kver}/kernel/drivers/hwmon/nct6686.ko
 	sudo depmod
-	sudo modprobe nct6687
+	sudo modprobe nct6686
 clean:
 	[ -d "${curpwd}/${kver}" ] && make -C /lib/modules/${kver}/build M=${curpwd}/${kver} clean
 

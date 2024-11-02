@@ -54,7 +54,7 @@ static const char * const nct6683_chip_names[] = {
 	"NCT6687D",
 };
 
-#define DRVNAME "nct6683"
+#define DRVNAME "nct6686"
 
 /*
  * Super-I/O constants and functions
@@ -957,10 +957,10 @@ static umode_t nct6683_pwm_is_visible(struct kobject *kobj,
 		return 0;
 
 	/* Only update pwm values for Mitac boards */
-	if (data->customer_id == NCT6683_CUSTOMER_ID_MITAC)
+	// if (data->customer_id == NCT6683_CUSTOMER_ID_MITAC)
 		return attr->mode | S_IWUSR;
 
-	return attr->mode;
+	// return attr->mode;
 }
 
 static struct sensor_device_template *nct6683_attributes_pwm_template[] = {
@@ -1510,8 +1510,8 @@ static void __exit sensors_nct6683_exit(void)
 	platform_driver_unregister(&nct6683_driver);
 }
 
-MODULE_AUTHOR("Guenter Roeck <linux@roeck-us.net>");
-MODULE_DESCRIPTION("NCT6683D driver");
+MODULE_AUTHOR("Zong Jhe Wu <s25g5d4@gmail.com>");
+MODULE_DESCRIPTION("NCT6686D driver");
 MODULE_LICENSE("GPL");
 
 module_init(sensors_nct6683_init);
