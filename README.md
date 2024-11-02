@@ -1,6 +1,4 @@
-![https://valid.x86.fr/vsb4yv](https://valid.x86.fr/cache/banner/vsb4yv-6.png)
-![https://valid.x86.fr/20aiek](https://valid.x86.fr/cache/banner/20aiek-6.png)
-# NCT6687D Kernel module
+# WIP - NCT6686D Kernel module
 
 This kernel module permit to recognize the chipset Nuvoton NCT6687-R in lm-sensors package.
 This sensor is present on some B550 motherboard such as MSI or ASUS.
@@ -280,7 +278,7 @@ loading nct6687 fails. `journalctl` shows `ACPI: OSL: Resource conflict; ACPI su
 * add `acpi_enforce_resources=lax` as a kernel parameter
 
 ### Loading fails during startup
-`dmesg` / `journalctl` shows 
+`dmesg` / `journalctl` shows
 ```
 kernel: nct6687: EC base I/O port unconfigured
 systemd-modules-load[339]: Failed to insert module 'nct6687': No such device
