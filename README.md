@@ -5,6 +5,12 @@ This sensor is present on some A620 / B650 motherboard such as ASRock.
 
 The implementation is based on https://github.com/Fred78290/nct6687d and in-tree kernel driver
 nct6683.
+
+## Features
+
+* Support some newer ASRock AMD motherboards, specifically A620I Lighting WiFi
+* Voltage, temperature, fan speed, and PWM value
+* Set PWM value
 <br><br>
 
 ## Installation
