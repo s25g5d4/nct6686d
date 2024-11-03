@@ -3,7 +3,7 @@
 %global debug_package %{nil}
 %endif
 
-%global prjname nct6687d
+%global prjname nct6686d
 %global pkgver MAKEFILE_PKGVER
 %global commithash MAKEFILE_COMMITHASH
 %define buildforkernels akmod
@@ -13,8 +13,8 @@ Version:        1.0.%{pkgver}
 Release:        git%{commithash}
 Summary:        Kernel module (kmod) for %{prjname}
 License:        GPL-2.0
-URL:            https://github.com/Fred78290/nct6687d
-Source0:        nct6687d-%{version}.tar.gz
+URL:            https://github.com/s25g5d4/nct6686d
+Source0:        nct6686d-%{version}.tar.gz
 BuildRoot:      %{_tmppath}/%{name}-%{version}-root-%(%{__id_u} -n)
 
 
@@ -22,7 +22,7 @@ BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  elfutils-libelf-devel
 BuildRequires:  kmodtool
-Conflicts: 	    nct6687d-kmod-common
+Conflicts: 	    nct6686d-kmod-common
 
 %{expand:%(kmodtool --target %{_target_cpu} --kmodname %{prjname} %{?buildforkernels:--%{buildforkernels}} %{?kernels:--for-kernels "%{?kernels}"} 2>/dev/null) }
 
@@ -32,10 +32,10 @@ Conflicts: 	    nct6687d-kmod-common
 %prep
 kmodtool --target %{_target_cpu} --kmodname %{prjname} %{?buildforkernels:--%{buildforkernels}} %{?kernels:--for-kernels "%{?kernels}"} 2>/dev/null
 
-%autosetup -n nct6687d-%{version}
+%autosetup -n nct6686d-%{version}
 
 for kernel_version in %{?kernel_versions} ; do
-    cp -a nct6687d _kmod_build_${kernel_version%%___*}
+    cp -a nct6686d _kmod_build_${kernel_version%%___*}
 done
 
 %build
@@ -53,5 +53,5 @@ done
 
 
 %changelog
-* Wed Jan 04 2023 Frederic BOLTZ <frederic.boltz@gmail.com> - %{version}
+* Sun Nove 03 2024 Zong Jhe Wu <s25g5d4@gmail.com> - %{version}
 - Initial package

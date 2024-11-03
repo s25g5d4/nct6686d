@@ -1,13 +1,13 @@
 %global pkgver MAKEFILE_PKGVER
 %global commithash MAKEFILE_COMMITHASH
 
-Name:           nct6687d
+Name:           nct6686d
 Version:        1.0.%{pkgver}
 Release:        git%{commithash}
 Summary:        Kernel module (kmod) for %{prjname}
 License:        GPL-2.0
-URL:            https://github.com/Fred78290/nct6687d
-Source0:        nct6687.conf
+URL:            https://github.com/s25g5d4/nct6686d
+Source0:        nct6686.conf
 
 # For kmod package
 Provides:       %{name}-kmod-common = %{version}-%{release}
@@ -25,11 +25,11 @@ BuildArch:      noarch
 
 %install
 
-install -D -m 0644 %{SOURCE0} %{buildroot}%{_modulesloaddir}/nct6687.conf
+install -D -m 0644 %{SOURCE0} %{buildroot}%{_modulesloaddir}/nct6686.conf
 
 %files
-%{_modulesloaddir}/nct6687.conf
+%{_modulesloaddir}/nct6686.conf
 
 %changelog
-* Wed Jan 04 2023 Frederic BOLTZ <frederic.boltz@gmail.com> - %{version}
+* Sun Nove 03 2024 Zong Jhe Wu <s25g5d4@gmail.com> - %{version}
 - Initial package
