@@ -36,7 +36,25 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 
+#ifndef MIN
+#define MIN(a,b) (((a)<(b))?(a):(b))
+#endif
+
+#ifndef MAX
+#define MAX(a,b) (((a)>(b))?(a):(b))
+#endif
+
 enum kinds { nct6683, nct6686, nct6687 };
+
+enum pwm_enable
+{
+	manual_mode = 1,
+	/*
+	 * There are multiple automatic modes, none of which is configurable by
+	 * this module yet.
+	 */
+	firmware_mode = 99,
+};
 
 static bool force;
 module_param(force, bool, 0);
@@ -167,9 +185,10 @@ superio_exit(int ioreg)
 
 #define NCT6683_REG_FAN_MIN(x)		(0x3b8 + (x) * 2)	/* 16 bit */
 
-#define NCT6683_REG_FAN_CFG_CTRL	0xa01
-#define NCT6683_FAN_CFG_REQ		0x80
-#define NCT6683_FAN_CFG_DONE		0x40
+#define NCT6686_REG_FAN_CTRL_MODE	0xa00
+#define NCT6686_REG_FAN_PWM_COMMAND	0xa01
+#define NCT6686_FAN_CFG_REQ		0x80
+#define NCT6686_FAN_CFG_DONE		0x00
 
 #define NCT6683_REG_CUSTOMER_ID		0x602
 #define NCT6683_CUSTOMER_ID_INTEL	0x805
@@ -177,9 +196,10 @@ superio_exit(int ioreg)
 #define NCT6683_CUSTOMER_ID_MSI		0x201
 #define NCT6683_CUSTOMER_ID_MSI2	0x200
 #define NCT6683_CUSTOMER_ID_MSI3	0x207
-#define NCT6683_CUSTOMER_ID_ASROCK		0xe2c
+#define NCT6683_CUSTOMER_ID_ASROCK	0xe2c
 #define NCT6683_CUSTOMER_ID_ASROCK2	0xe1b
 #define NCT6683_CUSTOMER_ID_ASROCK3	0x1631
+#define NCT6683_CUSTOMER_ID_ASROCK4	0x1633
 
 #define NCT6683_REG_BUILD_YEAR		0x604
 #define NCT6683_REG_BUILD_MONTH		0x605
@@ -318,6 +338,7 @@ struct nct6683_data {
 	u8 in_src[NCT6683_NUM_REG_MON];
 
 	struct mutex update_lock;	/* used to protect sensor updates */
+	struct mutex ec_io_lock;	/* used to protect EC io */
 	bool valid;			/* true if following fields are valid */
 	unsigned long last_updated;	/* In jiffies */
 
@@ -325,25 +346,24 @@ struct nct6683_data {
 	u8 in[3][NCT6683_NUM_REG_MON];	/* [0]=in, [1]=in_max, [2]=in_min */
 
 	/* Temperature attribute values */
-	s16 temp_in[NCT6683_NUM_REG_MON];
-	s8 temp[4][NCT6683_NUM_REG_MON];/* [0]=min, [1]=max, [2]=hyst,
-					 * [3]=crit
-					 */
+	s32 temp[3][NCT6683_NUM_REG_MON]; /* [0]=temp, [1]=temp_min,
+					   * [2]=temp_max
+					   */
 
 	/* Fan attribute values */
-	unsigned int rpm[NCT6683_NUM_REG_FAN];
-	u16 fan_min[NCT6683_NUM_REG_FAN];
+	u16 rpm[3][NCT6683_NUM_REG_FAN]; /* [0]=rpm, [1]=rpm_min, [1]=rpm_max */
+	u8 initial_fan_ctrl_mode[NCT6683_NUM_REG_PWM];
+	u8 initial_fan_pwm_cmd[NCT6683_NUM_REG_PWM];
+	bool restore_default_fan_ctrl_required[NCT6683_NUM_REG_PWM];
 	u8 fanin_cfg[NCT6683_NUM_REG_FAN];
 	u8 fanout_cfg[NCT6683_NUM_REG_FAN];
 	u16 have_fan;			/* some fan inputs can be disabled */
 
 	u8 have_pwm;
 	u8 pwm[NCT6683_NUM_REG_PWM];
+	enum pwm_enable pwm_enable[NCT6683_NUM_REG_PWM];
 
-#ifdef CONFIG_PM
-	/* Remember extra register values over suspend/resume */
 	u8 hwm_cfg;
-#endif
 };
 
 struct nct6683_sio_data {
@@ -482,6 +502,8 @@ nct6683_create_attr_group(struct device *dev,
 	return group;
 }
 
+static void nct6686_save_fan_control(struct nct6683_data *data, int index);
+
 /* LSB is 16 mV, except for the following sources, where it is 32 mV */
 #define MON_SRC_VCC	0x60
 #define MON_SRC_VSB	0x61
@@ -502,9 +524,11 @@ static u16 nct6683_read(struct nct6683_data *data, u16 reg)
 {
 	int res;
 
+	mutex_lock(&data->ec_io_lock);
 	outb_p(0xff, data->addr + EC_PAGE_REG);		/* unlock */
 	outb_p(reg >> 8, data->addr + EC_PAGE_REG);
 	outb_p(reg & 0xff, data->addr + EC_INDEX_REG);
+	mutex_unlock(&data->ec_io_lock);
 	res = inb_p(data->addr + EC_DATA_REG);
 	return res;
 }
@@ -516,132 +540,101 @@ static u16 nct6683_read16(struct nct6683_data *data, u16 reg)
 
 static void nct6683_write(struct nct6683_data *data, u16 reg, u16 value)
 {
+	mutex_lock(&data->ec_io_lock);
 	outb_p(0xff, data->addr + EC_PAGE_REG);		/* unlock */
 	outb_p(reg >> 8, data->addr + EC_PAGE_REG);
 	outb_p(reg & 0xff, data->addr + EC_INDEX_REG);
 	outb_p(value & 0xff, data->addr + EC_DATA_REG);
+	mutex_unlock(&data->ec_io_lock);
 }
 
-static int get_in_reg(struct nct6683_data *data, int nr, int index)
+static void nct6683_update_voltage(struct nct6683_data *data)
 {
-	int ch = data->in_index[index];
-	int reg = -EINVAL;
-
-	switch (nr) {
-	case 0:
-		reg = NCT6683_REG_MON(ch);
-		break;
-	case 1:
-		if (data->customer_id != NCT6683_CUSTOMER_ID_INTEL)
-			reg = NCT6683_REG_MON_LOW(ch);
-		break;
-	case 2:
-		if (data->customer_id != NCT6683_CUSTOMER_ID_INTEL)
-			reg = NCT6683_REG_MON_HIGH(ch);
-		break;
-	default:
-		break;
-	}
-	return reg;
-}
-
-static int get_temp_reg(struct nct6683_data *data, int nr, int index)
-{
-	int ch = data->temp_index[index];
-	int reg = -EINVAL;
-
-	switch (data->customer_id) {
-	case NCT6683_CUSTOMER_ID_INTEL:
-		switch (nr) {
-		default:
-		case 1:	/* max */
-			reg = NCT6683_REG_INTEL_TEMP_MAX(ch);
-			break;
-		case 3:	/* crit */
-			reg = NCT6683_REG_INTEL_TEMP_CRIT(ch);
-			break;
-		}
-		break;
-	case NCT6683_CUSTOMER_ID_MITAC:
-	default:
-		switch (nr) {
-		default:
-		case 0:	/* min */
-			reg = NCT6683_REG_MON_LOW(ch);
-			break;
-		case 1:	/* max */
-			reg = NCT6683_REG_TEMP_MAX(ch);
-			break;
-		case 2:	/* hyst */
-			reg = NCT6683_REG_TEMP_HYST(ch);
-			break;
-		case 3:	/* crit */
-			reg = NCT6683_REG_MON_HIGH(ch);
-			break;
-		}
-		break;
-	}
-	return reg;
-}
-
-static void nct6683_update_pwm(struct device *dev)
-{
-	struct nct6683_data *data = dev_get_drvdata(dev);
 	int i;
 
-	for (i = 0; i < NCT6683_NUM_REG_PWM; i++) {
+	for (i = 0; i < data->in_num; i++) {
+		u8 ch = data->in_index[i];
+		u8 in = nct6683_read(data, NCT6683_REG_MON(ch));
+
+		data->in[0][i] = in;
+		data->in[1][i] = MIN(in, data->in[1][i]);
+		data->in[2][i] = MAX(in, data->in[2][i]);
+		// pr_debug("nct6683_update_voltage[%d], in%d, in_index=%d, addr=0x%04x, value=%d\n", index, index, ch, NCT6683_REG_MON(ch), in);
+	}
+}
+
+static void nct6683_update_temperatures(struct nct6683_data *data)
+{
+	int i;
+
+	for (i = 0; i < data->temp_num; i++) {
+		u8 ch = data->temp_index[i];
+		s16 temp_raw = nct6683_read16(data, NCT6683_REG_MON(ch));
+		s32 temp = ((s32)(temp_raw) / 128) * 500;
+
+		data->temp[0][i] = temp;
+		data->temp[1][i] = MIN(temp, data->temp[1][i]);
+		data->temp[2][i] = MAX(temp, data->temp[2][i]);
+		// pr_debug("nct6683_update_temperatures[%d], temp%d, in_index=%d, addr=0x%04x, value=%d\n", i, i, ch, NCT6683_REG_MON(ch), temp);
+	}
+}
+
+static enum pwm_enable
+nct6686_get_pwm_enable(struct nct6683_data *data, int index)
+{
+	u16 bitMask = 0x01 << index;
+	if (nct6683_read(data, NCT6686_REG_FAN_CTRL_MODE) & bitMask)
+	{
+		return manual_mode;
+	}
+	return firmware_mode;
+}
+
+static void nct6686_update_fans(struct nct6683_data *data)
+{
+	int i;
+
+	for (i = 0; i < NCT6683_NUM_REG_FAN; i++) {
+		if (!(data->have_fan & (1 << i)))
+			continue;
+
+		s16 rmp = nct6683_read16(data, NCT6683_REG_FAN_RPM(i));
+
+		data->rpm[0][i] = rmp;
+		data->rpm[1][i] = MIN(rmp, data->rpm[1][i]);
+		data->rpm[2][i] = MAX(rmp, data->rpm[2][i]);
+
+		pr_debug("nct6686_update_fans[%d], rpm=%d min=%d, max=%d",
+			 i, rmp, data->rpm[1][i], data->rpm[2][i]);
+	}
+
+	for (i = 0; i < NCT6683_NUM_REG_PWM; i++)
+	{
 		if (!(data->have_pwm & (1 << i)))
 			continue;
+
 		data->pwm[i] = nct6683_read(data, NCT6683_REG_PWM(i));
+		data->pwm_enable[i] = nct6686_get_pwm_enable(data, i);
+
+		pr_debug("nct6686_update_fans[%d], pwm=%d", i, data->pwm[i]);
 	}
 }
 
 static struct nct6683_data *nct6683_update_device(struct device *dev)
 {
 	struct nct6683_data *data = dev_get_drvdata(dev);
-	int i, j;
 
 	mutex_lock(&data->update_lock);
 
 	if (time_after(jiffies, data->last_updated + HZ) || !data->valid) {
 		/* Measured voltages and limits */
-		for (i = 0; i < data->in_num; i++) {
-			for (j = 0; j < 3; j++) {
-				int reg = get_in_reg(data, j, i);
-
-				if (reg >= 0)
-					data->in[j][i] =
-						nct6683_read(data, reg);
-			}
-		}
+		nct6683_update_voltage(data);
 
 		/* Measured temperatures and limits */
-		for (i = 0; i < data->temp_num; i++) {
-			u8 ch = data->temp_index[i];
-
-			data->temp_in[i] = nct6683_read16(data,
-							  NCT6683_REG_MON(ch));
-			for (j = 0; j < 4; j++) {
-				int reg = get_temp_reg(data, j, i);
-
-				if (reg >= 0)
-					data->temp[j][i] =
-						nct6683_read(data, reg);
-			}
-		}
+		nct6683_update_temperatures(data);
 
 		/* Measured fan speeds and limits */
-		for (i = 0; i < ARRAY_SIZE(data->rpm); i++) {
-			if (!(data->have_fan & (1 << i)))
-				continue;
-
-			data->rpm[i] = nct6683_read16(data,
-						NCT6683_REG_FAN_RPM(i));
-			data->fan_min[i] = nct6683_read16(data,
-						NCT6683_REG_FAN_MIN(i));
-		}
-
-		nct6683_update_pwm(dev);
+		nct6686_update_fans(data);
 
 		data->last_updated = jiffies;
 		data->valid = true;
@@ -713,32 +706,12 @@ static const struct sensor_template_group nct6683_in_template_group = {
 };
 
 static ssize_t
-show_fan(struct device *dev, struct device_attribute *attr, char *buf)
+show_fan_value(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
 	struct nct6683_data *data = nct6683_update_device(dev);
 
-	return sprintf(buf, "%d\n", data->rpm[sattr->index]);
-}
-
-static ssize_t
-show_fan_min(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct nct6683_data *data = nct6683_update_device(dev);
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-	int nr = sattr->index;
-
-	return sprintf(buf, "%d\n", data->fan_min[nr]);
-}
-
-static ssize_t
-show_fan_pulses(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-	struct nct6683_data *data = nct6683_update_device(dev);
-
-	return sprintf(buf, "%d\n",
-		       ((data->fanin_cfg[sattr->index] >> 5) & 0x03) + 1);
+	return sprintf(buf, "%d\n", data->rpm[sattr->index][sattr->nr]);
 }
 
 static umode_t nct6683_fan_is_visible(struct kobject *kobj,
@@ -747,24 +720,17 @@ static umode_t nct6683_fan_is_visible(struct kobject *kobj,
 	struct device *dev = kobj_to_dev(kobj);
 	struct nct6683_data *data = dev_get_drvdata(dev);
 	int fan = index / 3;	/* fan index */
-	int nr = index % 3;	/* attribute index */
 
 	if (!(data->have_fan & (1 << fan)))
-		return 0;
-
-	/*
-	 * Intel may have minimum fan speed limits,
-	 * but register location and encoding are unknown.
-	 */
-	if (nr == 2 && data->customer_id == NCT6683_CUSTOMER_ID_INTEL)
 		return 0;
 
 	return attr->mode;
 }
 
-SENSOR_TEMPLATE(fan_input, "fan%d_input", S_IRUGO, show_fan, NULL, 0);
-SENSOR_TEMPLATE(fan_pulses, "fan%d_pulses", S_IRUGO, show_fan_pulses, NULL, 0);
-SENSOR_TEMPLATE(fan_min, "fan%d_min", S_IRUGO, show_fan_min, NULL, 0);
+SENSOR_TEMPLATE_2(fan_input, "fan%d_input", S_IRUGO,
+		  show_fan_value, NULL, 0, 0);
+SENSOR_TEMPLATE_2(fan_min, "fan%d_min", S_IRUGO, show_fan_value, NULL, 0, 1);
+SENSOR_TEMPLATE_2(fan_max, "fan%d_max", S_IRUGO, show_fan_value, NULL, 0, 2);
 
 /*
  * nct6683_fan_is_visible uses the index into the following array
@@ -773,8 +739,8 @@ SENSOR_TEMPLATE(fan_min, "fan%d_min", S_IRUGO, show_fan_min, NULL, 0);
  */
 static struct sensor_device_template *nct6683_attributes_fan_template[] = {
 	&sensor_dev_template_fan_input,
-	&sensor_dev_template_fan_pulses,
 	&sensor_dev_template_fan_min,
+	&sensor_dev_template_fan_max,
 	NULL
 };
 
@@ -795,100 +761,25 @@ show_temp_label(struct device *dev, struct device_attribute *attr, char *buf)
 }
 
 static ssize_t
-show_temp8(struct device *dev, struct device_attribute *attr, char *buf)
+show_temp_value(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
 	struct nct6683_data *data = nct6683_update_device(dev);
-	int index = sattr->index;
-	int nr = sattr->nr;
 
-	return sprintf(buf, "%d\n", data->temp[index][nr] * 1000);
-}
-
-static ssize_t
-show_temp_hyst(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-	struct nct6683_data *data = nct6683_update_device(dev);
-	int nr = sattr->index;
-	int temp = data->temp[1][nr] - data->temp[2][nr];
-
-	return sprintf(buf, "%d\n", temp * 1000);
-}
-
-static ssize_t
-show_temp16(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-	struct nct6683_data *data = nct6683_update_device(dev);
-	int index = sattr->index;
-
-	return sprintf(buf, "%d\n", (data->temp_in[index] / 128) * 500);
-}
-
-/*
- * Temperature sensor type is determined by temperature source
- * and can not be modified.
- * 0x02..0x07: Thermal diode
- * 0x08..0x18: Thermistor
- * 0x20..0x2b: Intel PECI
- * 0x42..0x49: AMD TSI
- * Others are unspecified (not visible)
- */
-
-static int get_temp_type(u8 src)
-{
-	if (src >= 0x02 && src <= 0x07)
-		return 3;	/* thermal diode */
-	else if (src >= 0x08 && src <= 0x18)
-		return 4;	/* thermistor */
-	else if (src >= 0x20 && src <= 0x2b)
-		return 6;	/* PECI */
-	else if (src >= 0x42 && src <= 0x49)
-		return 5;
-
-	return 0;
-}
-
-static ssize_t
-show_temp_type(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct nct6683_data *data = nct6683_update_device(dev);
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-	int nr = sattr->index;
-	return sprintf(buf, "%d\n", get_temp_type(data->temp_src[nr]));
+	return sprintf(buf, "%d\n", data->temp[sattr->index][sattr->nr]);
 }
 
 static umode_t nct6683_temp_is_visible(struct kobject *kobj,
 				       struct attribute *attr, int index)
 {
-	struct device *dev = kobj_to_dev(kobj);
-	struct nct6683_data *data = dev_get_drvdata(dev);
-	int temp = index / 7;	/* temp index */
-	int nr = index % 7;	/* attribute index */
-
-	/*
-	 * Intel does not have low temperature limits or temperature hysteresis
-	 * registers, or at least register location and encoding is unknown.
-	 */
-	if ((nr == 2 || nr == 4) &&
-	    data->customer_id == NCT6683_CUSTOMER_ID_INTEL)
-		return 0;
-
-	if (nr == 6 && get_temp_type(data->temp_src[temp]) == 0)
-		return 0;				/* type */
-
 	return attr->mode;
 }
 
-SENSOR_TEMPLATE(temp_input, "temp%d_input", S_IRUGO, show_temp16, NULL, 0);
 SENSOR_TEMPLATE(temp_label, "temp%d_label", S_IRUGO, show_temp_label, NULL, 0);
-SENSOR_TEMPLATE_2(temp_min, "temp%d_min", S_IRUGO, show_temp8, NULL, 0, 0);
-SENSOR_TEMPLATE_2(temp_max, "temp%d_max", S_IRUGO, show_temp8, NULL, 0, 1);
-SENSOR_TEMPLATE(temp_max_hyst, "temp%d_max_hyst", S_IRUGO, show_temp_hyst, NULL,
-		0);
-SENSOR_TEMPLATE_2(temp_crit, "temp%d_crit", S_IRUGO, show_temp8, NULL, 0, 3);
-SENSOR_TEMPLATE(temp_type, "temp%d_type", S_IRUGO, show_temp_type, NULL, 0);
+SENSOR_TEMPLATE_2(temp_input, "temp%d_input", S_IRUGO,
+		  show_temp_value, NULL, 0, 0);
+SENSOR_TEMPLATE_2(temp_min, "temp%d_min", S_IRUGO, show_temp_value, NULL, 0, 1);
+SENSOR_TEMPLATE_2(temp_max, "temp%d_max", S_IRUGO, show_temp_value, NULL, 0, 2);
 
 /*
  * nct6683_temp_is_visible uses the index into the following array
@@ -896,13 +787,10 @@ SENSOR_TEMPLATE(temp_type, "temp%d_type", S_IRUGO, show_temp_type, NULL, 0);
  * Any change in order or content must be matched.
  */
 static struct sensor_device_template *nct6683_attributes_temp_template[] = {
-	&sensor_dev_template_temp_input,
 	&sensor_dev_template_temp_label,
-	&sensor_dev_template_temp_min,		/* 2 */
-	&sensor_dev_template_temp_max,		/* 3 */
-	&sensor_dev_template_temp_max_hyst,	/* 4 */
-	&sensor_dev_template_temp_crit,		/* 5 */
-	&sensor_dev_template_temp_type,		/* 6 */
+	&sensor_dev_template_temp_input,
+	&sensor_dev_template_temp_min,
+	&sensor_dev_template_temp_max,
 	NULL
 };
 
@@ -930,41 +818,153 @@ store_pwm(struct device *dev, struct device_attribute *attr, const char *buf,
 	struct nct6683_data *data = dev_get_drvdata(dev);
 	int index = sattr->index;
 	unsigned long val;
+	int retry;
+	u16 readback;
+	u16 mode;
+	u8 bitmask;
 
 	if (kstrtoul(buf, 10, &val) || val > 255)
 		return -EINVAL;
 
 	mutex_lock(&data->update_lock);
-	nct6683_write(data, NCT6683_REG_FAN_CFG_CTRL, NCT6683_FAN_CFG_REQ);
-	usleep_range(1000, 2000);
+
+	nct6686_save_fan_control(data, index);
+
+	mode = nct6683_read(data, NCT6686_REG_FAN_CTRL_MODE);
+	bitmask = (u8)(0x01 << index);
+
+	mode = (u8)(mode | bitmask);
+	nct6683_write(data, NCT6686_REG_FAN_CTRL_MODE, mode);
+
+	nct6683_write(data, NCT6686_REG_FAN_PWM_COMMAND, NCT6686_FAN_CFG_REQ);
+	msleep(50);
 	nct6683_write(data, NCT6683_REG_PWM_WRITE(index), val);
-	nct6683_write(data, NCT6683_REG_FAN_CFG_CTRL, NCT6683_FAN_CFG_DONE);
+	nct6683_write(data, NCT6686_REG_FAN_PWM_COMMAND, NCT6686_FAN_CFG_DONE);
+
+	for (retry = 0; retry < 20; retry++) {
+		msleep(50);
+
+		readback = nct6683_read(data, NCT6683_REG_PWM(index));
+		if (readback == val)
+			break;
+	}
+	data->pwm[index] = readback;
+	data->pwm_enable[index] = nct6686_get_pwm_enable(data, index);
+
+	mutex_unlock(&data->update_lock);
+
+	return count;
+}
+
+static ssize_t
+show_pwm_enable(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct nct6683_data *data = nct6683_update_device(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+
+	return sprintf(buf, "%d\n", data->pwm_enable[sattr->nr]);
+}
+
+static ssize_t
+store_pwm_enable(struct device *dev, struct device_attribute *attr,
+		 const char *buf, size_t count)
+{
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	struct nct6683_data *data = dev_get_drvdata(dev);
+	int index = sattr->nr;
+	unsigned long val;
+	u16 mode;
+	u8 bitmask;
+
+	if (index >= NCT6683_NUM_REG_FAN || kstrtoul(buf, 10, &val))
+		return -EINVAL;
+	if (val != manual_mode && val != firmware_mode)
+		return -EINVAL;
+
+	mutex_lock(&data->update_lock);
+
+	nct6686_save_fan_control(data, index);
+
+	mode = nct6683_read(data, NCT6686_REG_FAN_CTRL_MODE);
+
+	bitmask = (u8)(0x01 << index);
+	if (val == manual_mode)
+	{
+		mode = (u8)(mode | bitmask);
+	}
+	else if (val == firmware_mode)
+	{
+		mode = (u8)(mode & ~bitmask);
+	}
+
+	nct6683_write(data, NCT6686_REG_FAN_CTRL_MODE, mode);
+
 	mutex_unlock(&data->update_lock);
 
 	return count;
 }
 
 SENSOR_TEMPLATE(pwm, "pwm%d", S_IRUGO, show_pwm, store_pwm, 0);
+SENSOR_TEMPLATE_2(pwm_enable, "pwm%d_enable", S_IRUGO,
+		  show_pwm_enable, store_pwm_enable, 0, 0);
+
+static void nct6686_save_fan_control(struct nct6683_data *data, int index)
+{
+	if (data->restore_default_fan_ctrl_required[index] == false)
+	{
+		u16 reg = nct6683_read(data, NCT6686_REG_FAN_CTRL_MODE);
+		u16 bitmask = 0x01 << index;
+		u8 pwm = nct6683_read(data, NCT6686_REG_FAN_PWM_COMMAND);
+
+		data->initial_fan_ctrl_mode[index] = (u8)(reg & bitmask);
+		data->initial_fan_pwm_cmd[index] = pwm;
+
+		data->restore_default_fan_ctrl_required[index] = true;
+	}
+}
+
+static void nct6686_restore_fan_control(struct nct6683_data *data, int index)
+{
+	if (data->restore_default_fan_ctrl_required[index])
+	{
+		u8 mode = nct6683_read(data, NCT6686_REG_FAN_CTRL_MODE);
+		u8 bitmask = 0x01 << index;
+		mode = (u8)((mode & ~bitmask) |
+			     data->initial_fan_ctrl_mode[index]);
+
+		nct6683_write(data, NCT6686_REG_FAN_CTRL_MODE, mode);
+
+		nct6683_write(data, NCT6686_REG_FAN_PWM_COMMAND,
+			      NCT6686_FAN_CFG_REQ);
+		msleep(50);
+		nct6683_write(data, NCT6683_REG_PWM_WRITE(index),
+			      data->initial_fan_pwm_cmd[index]);
+		nct6683_write(data, NCT6686_REG_FAN_PWM_COMMAND,
+			      NCT6686_FAN_CFG_DONE);
+		msleep(50);
+
+		data->restore_default_fan_ctrl_required[index] = false;
+
+		// pr_debug("nct6686_restore_fan_control[%d], addr=%04X, ctrl=%04X, initial_fan_pwm_cmd=%d\n", index, NCT6686_REG_FAN_PWM_COMMAND, NCT6683_REG_PWM_WRITE(index), data->initial_fan_pwm_cmd[index]);
+	}
+}
 
 static umode_t nct6683_pwm_is_visible(struct kobject *kobj,
 				      struct attribute *attr, int index)
 {
 	struct device *dev = kobj_to_dev(kobj);
 	struct nct6683_data *data = dev_get_drvdata(dev);
-	int pwm = index;	/* pwm index */
+	int pwm = index / 2;	/* pwm index */
 
 	if (!(data->have_pwm & (1 << pwm)))
 		return 0;
 
-	/* Only update pwm values for Mitac boards */
-	// if (data->customer_id == NCT6683_CUSTOMER_ID_MITAC)
-		return attr->mode | S_IWUSR;
-
-	// return attr->mode;
+	return attr->mode | S_IWUSR;
 }
 
 static struct sensor_device_template *nct6683_attributes_pwm_template[] = {
 	&sensor_dev_template_pwm,
+	&sensor_dev_template_pwm_enable,
 	NULL
 };
 
@@ -1135,14 +1135,24 @@ nct6683_setup_fans(struct nct6683_data *data)
 
 	for (i = 0; i < NCT6683_NUM_REG_FAN; i++) {
 		reg = nct6683_read(data, NCT6683_REG_FANIN_CFG(i));
-		if (reg & 0x80)
+		if (reg & 0x80) {
 			data->have_fan |= 1 << i;
+			u16 rpm = nct6683_read16(data, NCT6683_REG_FAN_RPM(i));
+			data->rpm[0][i] = rpm;
+			data->rpm[1][i] = rpm;
+			data->rpm[2][i] = rpm;
+		}
 		data->fanin_cfg[i] = reg;
 	}
 	for (i = 0; i < NCT6683_NUM_REG_PWM; i++) {
 		reg = nct6683_read(data, NCT6683_REG_FANOUT_CFG(i));
-		if (reg & 0x80)
+		if (reg & 0x80) {
 			data->have_pwm |= 1 << i;
+			u16 reg = nct6683_read(data, NCT6686_REG_FAN_CTRL_MODE);
+			u16 bitmask = 0x01 << i;
+			data->initial_fan_ctrl_mode[i] = (u8)(reg & bitmask);
+			data->restore_default_fan_ctrl_required[i] = false;
+		}
 		data->fanout_cfg[i] = reg;
 	}
 }
@@ -1181,10 +1191,25 @@ static void nct6683_setup_sensors(struct nct6683_data *data)
 		if (reg < MON_VOLTAGE_START) {
 			data->temp_index[data->temp_num] = i;
 			data->temp_src[data->temp_num] = reg;
+
+			s16 temp_raw = nct6683_read16(data, NCT6683_REG_MON(i));
+			s32 temp = ((s32)(temp_raw) / 128) * 500;
+
+			data->temp[0][data->temp_num] = temp;
+			data->temp[1][data->temp_num] = temp;
+			data->temp[2][data->temp_num] = temp;
+
 			data->temp_num++;
 		} else {
 			data->in_index[data->in_num] = i;
 			data->in_src[data->in_num] = reg;
+
+			u8 in = nct6683_read(data, NCT6683_REG_MON(i));
+
+			data->in[0][data->in_num] = in;
+			data->in[1][data->in_num] = in;
+			data->in[2][data->in_num] = in;
+
 			data->in_num++;
 		}
 	}
@@ -1213,32 +1238,29 @@ static int nct6683_probe(struct platform_device *pdev)
 	data->sioreg = sio_data->sioreg;
 	data->addr = res->start;
 	mutex_init(&data->update_lock);
+	mutex_init(&data->ec_io_lock);
 	platform_set_drvdata(pdev, data);
 
 	data->customer_id = nct6683_read16(data, NCT6683_REG_CUSTOMER_ID);
 
+	pr_info("Customer ID 0x%04x\n", data->customer_id);
 	/* By default only instantiate driver if the customer ID is known */
 	switch (data->customer_id) {
 	case NCT6683_CUSTOMER_ID_INTEL:
-		break;
 	case NCT6683_CUSTOMER_ID_MITAC:
-		break;
 	case NCT6683_CUSTOMER_ID_MSI:
-		break;
 	case NCT6683_CUSTOMER_ID_MSI2:
-		break;
 	case NCT6683_CUSTOMER_ID_MSI3:
-		break;
 	case NCT6683_CUSTOMER_ID_ASROCK:
-		break;
 	case NCT6683_CUSTOMER_ID_ASROCK2:
-		break;
 	case NCT6683_CUSTOMER_ID_ASROCK3:
+	case NCT6683_CUSTOMER_ID_ASROCK4:
 		break;
 	default:
 		if (!force)
 			return -ENODEV;
-		dev_warn(dev, "Enabling support for unknown customer ID 0x%04x\n", data->customer_id);
+		pr_info("Enabling support for unknown customer ID 0x%04x\n",
+			data->customer_id);
 		break;
 	}
 
@@ -1307,10 +1329,27 @@ static int nct6683_probe(struct platform_device *pdev)
 	return PTR_ERR_OR_ZERO(hwmon_dev);
 }
 
-#ifdef CONFIG_PM
-static int nct6683_suspend(struct device *dev)
+static int nct6683_remove(struct platform_device *pdev)
 {
-	struct nct6683_data *data = nct6683_update_device(dev);
+	struct device *dev = &pdev->dev;
+	struct nct6683_data *data = dev_get_drvdata(dev);
+	int i;
+
+	mutex_lock(&data->update_lock);
+
+	for (i = 0; i < NCT6683_NUM_REG_PWM; i++)
+	{
+		nct6686_restore_fan_control(data, i);
+	}
+
+	mutex_unlock(&data->update_lock);
+
+	return 0;
+}
+
+static int nct6683_suspend(struct platform_device *pdev, pm_message_t state)
+{
+	struct nct6683_data *data = nct6683_update_device(&pdev->dev);
 
 	mutex_lock(&data->update_lock);
 	data->hwm_cfg = nct6683_read(data, NCT6683_HWM_CFG);
@@ -1319,8 +1358,9 @@ static int nct6683_suspend(struct device *dev)
 	return 0;
 }
 
-static int nct6683_resume(struct device *dev)
+static int nct6683_resume(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
 	struct nct6683_data *data = dev_get_drvdata(dev);
 
 	mutex_lock(&data->update_lock);
@@ -1334,24 +1374,24 @@ static int nct6683_resume(struct device *dev)
 	return 0;
 }
 
-static const struct dev_pm_ops nct6683_dev_pm_ops = {
-	.suspend = nct6683_suspend,
-	.resume = nct6683_resume,
-	.freeze = nct6683_suspend,
-	.restore = nct6683_resume,
-};
+// static const struct dev_pm_ops nct6687_dev_pm_ops = {
+// 	.suspend = nct6687_suspend,
+// 	.resume = nct6687_resume,
+// 	.freeze = nct6687_suspend,
+// 	.restore = nct6687_resume,
+// };
 
-#define NCT6683_DEV_PM_OPS	(&nct6683_dev_pm_ops)
-#else
 #define NCT6683_DEV_PM_OPS	NULL
-#endif /* CONFIG_PM */
 
-static struct platform_driver nct6683_driver = {
+static struct platform_driver nct6686_driver = {
 	.driver = {
 		.name	= DRVNAME,
 		.pm	= NCT6683_DEV_PM_OPS,
 	},
 	.probe		= nct6683_probe,
+	.remove		= nct6683_remove,
+	.suspend	= nct6683_suspend,
+	.resume		= nct6683_resume,
 };
 
 static int __init nct6683_find(int sioaddr, struct nct6683_sio_data *sio_data)
@@ -1429,7 +1469,7 @@ static int __init sensors_nct6683_init(void)
 	int address;
 	int i, err;
 
-	err = platform_driver_register(&nct6683_driver);
+	err = platform_driver_register(&nct6686_driver);
 	if (err)
 		return err;
 
@@ -1495,7 +1535,7 @@ exit_device_unregister:
 			platform_device_unregister(pdev[i]);
 	}
 exit_unregister:
-	platform_driver_unregister(&nct6683_driver);
+	platform_driver_unregister(&nct6686_driver);
 	return err;
 }
 
@@ -1507,7 +1547,7 @@ static void __exit sensors_nct6683_exit(void)
 		if (pdev[i])
 			platform_device_unregister(pdev[i]);
 	}
-	platform_driver_unregister(&nct6683_driver);
+	platform_driver_unregister(&nct6686_driver);
 }
 
 MODULE_AUTHOR("Zong Jhe Wu <s25g5d4@gmail.com>");
