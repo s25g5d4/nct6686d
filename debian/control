@@ -2,7 +2,7 @@ Source: nct6686d-dkms
 Section: kernel
 Priority: optional
 Maintainer: Zong Jhe Wu <s25g5d4@gmail.com>
-Build-Depends: debhelper, dkms
+Build-Depends: debhelper, dh-dkms
 Homepage: https://github.com/s25g5d4/nct6686d/
 
 Package: nct6686d-dkms
